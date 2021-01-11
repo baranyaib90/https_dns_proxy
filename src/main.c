@@ -13,6 +13,7 @@
 #include "https_client.h"
 #include "logging.h"
 #include "options.h"
+#include "stat.h"
 
 // Holds app state required for dns_server_cb.
 typedef struct {
@@ -20,6 +21,7 @@ typedef struct {
   struct curl_slist *resolv;
   const char *resolver_url;
   uint8_t using_dns_poller;
+  stat_t *stat;
 } app_state_t;
 
 typedef struct {
@@ -27,6 +29,8 @@ typedef struct {
   struct sockaddr_storage raddr;
   dns_server_t *dns_server;
   char* dns_req;
+  ev_tstamp start_tstamp;
+  stat_t *stat;
 } request_t;
 
 // Very very basic hostname parsing.
@@ -82,6 +86,9 @@ static void https_resp_cb(void *data, char *buf, size_t buflen) {
   if (buf != NULL) { // May be NULL for timeout, DNS failure, or something similar.
     dns_server_respond(req->dns_server, (struct sockaddr*)&req->raddr, buf, buflen);
   }
+  if (req->stat) {
+    stat_request_end(req->stat, buflen, ev_now(req->dns_server->loop) - req->start_tstamp);
+  }
   free(req);
 }
 
@@ -109,6 +116,12 @@ static void dns_server_cb(dns_server_t *dns_server, void *data,
   memcpy(&req->raddr, addr, dns_server->addrlen);  // NOLINT(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
   req->dns_server = dns_server;
   req->dns_req = dns_req; // To free buffer after https request is complete.
+  req->start_tstamp = ev_now(dns_server->loop);
+  req->stat = app->stat;
+
+  if (req->stat) {
+    stat_request_begin(app->stat, dns_req_len);
+  }
   https_client_fetch(app->https_client, app->resolver_url,
                      dns_req, dns_req_len, app->resolv, https_resp_cb, req);
 }
@@ -203,14 +216,18 @@ int main(int argc, char *argv[]) {
   //       valgrind will report a leak. :(
   struct ev_loop *loop = EV_DEFAULT;
 
+  stat_t stat;
+  stat_init(&stat, loop, opt.stats_interval);
+
   https_client_t https_client;
-  https_client_init(&https_client, &opt, loop);
+  https_client_init(&https_client, &opt, (opt.stats_interval ? &stat : NULL), loop);
 
   app_state_t app;
   app.https_client = &https_client;
   app.resolv = NULL;
   app.resolver_url = opt.resolver_url;
   app.using_dns_poller = 0;
+  app.stat = (opt.stats_interval ? &stat : NULL);
 
   dns_server_t dns_server;
   dns_server_init(&dns_server, loop, opt.listen_addr, opt.listen_port,
@@ -270,12 +287,14 @@ int main(int argc, char *argv[]) {
   ev_signal_stop(loop, &sigint);
   ev_signal_stop(loop, &sigpipe);
   dns_server_stop(&dns_server);
+  stat_stop(&stat);
 
   DLOG("re-entering loop");
   ev_run(loop, 0);
   DLOG("loop finished all events");
 
   dns_server_cleanup(&dns_server);
+  stat_cleanup(&stat);
   https_client_cleanup(&https_client);
 
   ev_loop_destroy(loop);
