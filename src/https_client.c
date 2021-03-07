@@ -147,6 +147,36 @@ static void https_fetch_ctx_init(https_client_t *client,
   }
 }
 
+static void https_response_body(char *ptr, size_t size)
+{
+  const size_t width = 0x10;
+
+  for (size_t i = 0; i < size; i += width) {
+    char buf[1024];
+    size_t buflen = sizeof(buf);
+    size_t off = 0;
+    memset(buf, 0, buflen);
+
+    off += snprintf(buf + off, buflen - off, "%4.4lx: ", (long)i);
+
+    /* show hex to the left */
+    for (size_t c = 0; c < width; c++) {
+      if(i+c < size)
+        off += snprintf(buf + off, buflen - off, "%02x ", ptr[i+c]);
+      else
+        off += snprintf(buf + off, buflen - off, "   ");
+    }
+
+    /* show data on the right */
+    for (size_t c = 0; (c < width) && (i+c < size); c++) {
+      char x = (ptr[i+c] >= 0x20 && ptr[i+c] < 0x7f) ? ptr[i+c] : '.';
+      off += snprintf(buf + off, buflen - off, "%c", x);
+    }
+
+    ELOG("%s", buf);
+  }
+}
+
 static void https_fetch_ctx_process_response(https_client_t *client,
                                              struct https_fetch_ctx *ctx)
 {
@@ -161,6 +191,9 @@ static void https_fetch_ctx_process_response(https_client_t *client,
   } else if (long_resp != 200) {
     ELOG("curl response code: %d", long_resp);
     faulty_response = 1;
+    if (ctx->buflen >= 0) {
+      https_response_body(ctx->buf, ctx->buflen);
+    }
   }
 
   if (logging_debug_enabled() || faulty_response || ctx->buflen == 0) {
