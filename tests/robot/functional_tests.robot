@@ -3,6 +3,7 @@ Documentation  Simple functional tests for https_dns_proxy
 Library        OperatingSystem
 Library        Process
 Library        Collections
+Library        DnsTcpClient.py
 
 
 *** Variables ***
@@ -18,6 +19,7 @@ Test Teardown  Stop Proxy
 Common Test Setup
   Set Test Variable  &{expected_logs}  loop destroyed=1  # last log line
   Set Test Variable  @{error_logs}  [F]  # any fatal error
+  Set Test Variable  @{dig_options}  +notcp  # UDP only
 
 Start Proxy
   [Arguments]  @{args}
@@ -64,7 +66,7 @@ Stop Proxy
 
 Start Dig
   [Arguments]  ${domain}=google.com
-  ${handle} =  Start Process  dig  +timeout\=${dig_timeout}  +retry\=${dig_retry}  @127.0.0.1  -p  ${PORT}  ${domain}
+  ${handle} =  Start Process  dig  +timeout\=${dig_timeout}  +retry\=${dig_retry}  @{dig_options}  @127.0.0.1  -p  ${PORT}  ${domain}
   ...  stderr=STDOUT  alias=dig
   RETURN  ${handle}
 
@@ -74,11 +76,13 @@ Stop Dig
   Log  ${result.stdout}
   Should Be Equal As Integers  ${result.rc}  0
   Should Contain  ${result.stdout}  ANSWER SECTION
+  RETURN  ${result.stdout}
 
 Run Dig
   [Arguments]  ${domain}=google.com
   ${handle} =  Start Dig  ${domain}
-  Stop Dig  ${handle}
+  ${dig_output} =  Stop Dig  ${handle}
+  RETURN  ${dig_output}
 
 Run Dig Parallel
   ${dig_handles} =  Create List
@@ -89,6 +93,12 @@ Run Dig Parallel
   FOR  ${handle}  IN  @{dig_handles}
     Stop Dig  ${handle}
   END
+
+Large Response Test
+  [Documentation]  https://dnscheck.tools/#more
+  Set Test Variable  @{dig_options}  @{dig_options}  -t  txt  #  ask for TXT response
+  ${dig_output} =  Run Dig  txtfill4096.test.dnscheck.tools
+  Should Contain  ${dig_output}  MSG SIZE \ rcvd: 4185  # expecting more than 4k large response
 
 
 *** Test Cases ***
@@ -107,4 +117,47 @@ Reuse HTTP/2 Connection
 Valgrind Resource Leak Check
   Start Proxy With Valgrind
   Run Dig Parallel
-  
+
+Valgrind Resource Leak Check TCP
+  Start Proxy With Valgrind
+  Set Test Variable  @{dig_options}  +tcp  # TCP only
+  Run Dig Parallel
+
+Large Response UDP
+  Start Proxy
+  Large Response Test
+
+Large Response TCP
+  Start Proxy
+  Set Test Variable  @{dig_options}  +tcp  # TCP only
+  Large Response Test
+
+Send TCP Requests Fragmented
+  [Documentation]  Check manually the debug logs of dns_server_tcp.c file!
+  Start Proxy
+  Open Tcp Client Connection  127.0.0.1  ${PORT}
+
+  Send Tcp Request Parts  1
+  Sleep  0.01
+  Send Tcp Request Parts  2
+  Sleep  0.01
+  Send Tcp Request Parts  3
+  Sleep  0.01
+  Send Tcp Request Parts  4  1
+  Sleep  1
+  ${dns_reply} =  Receive Tcp Response
+  Log  ${dns_reply}
+
+  Send Tcp Request Parts  2
+  Sleep  0.01
+  Send Tcp Request Parts  3  4  1  2
+  Sleep  0.5
+  ${dns_reply} =  Receive Tcp Response
+  Log  ${dns_reply}
+
+  Send Tcp Request Parts  3  4
+  Sleep  0.5
+  ${dns_reply} =  Receive Tcp Response
+  Log  ${dns_reply}
+
+  Close Tcp Client Connection

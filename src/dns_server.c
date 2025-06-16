@@ -52,7 +52,7 @@ static void watcher_cb(struct ev_loop __attribute__((unused)) *loop,
   }
 
   if (len < (int)sizeof(uint16_t)) {
-    WLOG("Malformed request received (too short).");
+    WLOG("Malformed request received, too short: %d", len);
     return;
   }
 

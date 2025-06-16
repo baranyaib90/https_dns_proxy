@@ -11,6 +11,7 @@
 
 #include "dns_poller.h"
 #include "dns_server.h"
+#include "dns_server_tcp.h"
 #include "https_client.h"
 #include "logging.h"
 #include "options.h"
@@ -28,7 +29,8 @@ typedef struct {
 
 // NOLINTNEXTLINE(altera-struct-pack-align)
 typedef struct {
-  dns_server_t *dns_server;
+  void *dns_server;
+  int sock_type;
   char* dns_req;
   stat_t *stat;
   ev_tstamp start_tstamp;
@@ -94,9 +96,13 @@ static void https_resp_cb(void *data, char *buf, size_t buflen) {
         WLOG("DNS request and response IDs are not matching: %hX != %hX",
              req->tx_id, response_id);
       } else {
-        dns_server_respond(req->dns_server, (struct sockaddr*)&req->raddr, buf, buflen);
+        if (req->sock_type == SOCK_DGRAM) {
+          dns_server_respond((dns_server_t *)req->dns_server, (struct sockaddr*)&req->raddr, buf, buflen);
+        } else {
+          dns_server_tcp_respond((dns_server_tcp_t *)req->dns_server, (struct sockaddr*)&req->raddr, buf, buflen);
+        }
         if (req->stat) {
-          stat_request_end(req->stat, buflen, ev_now(req->dns_server->loop) - req->start_tstamp);
+          stat_request_end(req->stat, buflen, ev_time() - req->start_tstamp);
         }
       }
     }
@@ -127,7 +133,46 @@ static void dns_server_cb(dns_server_t *dns_server, void *data,
   }
   req->tx_id = tx_id;
   memcpy(&req->raddr, tmp_remote_addr, dns_server->addrlen);  // NOLINT(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-  req->dns_server = dns_server;
+  req->dns_server = (void*)dns_server;
+  req->sock_type = SOCK_DGRAM;
+  req->dns_req = dns_req;  // To free buffer after https request is complete.
+  req->start_tstamp = ev_now(dns_server->loop);
+  req->stat = app->stat;
+
+  if (req->stat) {
+    stat_request_begin(app->stat, dns_req_len);
+  }
+  https_client_fetch(app->https_client, app->resolver_url,
+                     req->dns_req, dns_req_len, app->resolv, req->tx_id, https_resp_cb, req);
+}
+
+// TODO: merge dns_server_tcp_cb and dns_server_cb
+
+static void dns_server_tcp_cb(dns_server_tcp_t *dns_server, void *data,
+                              struct sockaddr* tmp_remote_addr,
+                              char *dns_req, size_t dns_req_len) {
+  app_state_t *app = (app_state_t *)data;
+
+  uint16_t tx_id = ntohs(*((uint16_t*)dns_req));
+  DLOG("Received request for id: %hX, len: %d", tx_id, dns_req_len);
+
+  // If we're not yet bootstrapped, don't answer. libcurl will fall back to
+  // gethostbyname() which can cause a DNS loop due to the nameserver listed
+  // in resolv.conf being or depending on https_dns_proxy itself.
+  if(app->using_dns_poller && (app->resolv == NULL || app->resolv->data == NULL)) {
+    WLOG("%04hX: Query received before bootstrapping is completed, discarding.", tx_id);
+    free(dns_req);
+    return;
+  }
+
+  request_t *req = (request_t *)calloc(1, sizeof(request_t));
+  if (req == NULL) {
+    FLOG("%04hX: Out of mem", tx_id);
+  }
+  req->tx_id = tx_id;
+  memcpy(&req->raddr, tmp_remote_addr, dns_server->addrlen);  // NOLINT(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+  req->dns_server = (void*)dns_server;
+  req->sock_type = SOCK_STREAM;
   req->dns_req = dns_req;  // To free buffer after https request is complete.
   req->start_tstamp = ev_now(dns_server->loop);
   req->stat = app->stat;
@@ -324,6 +369,9 @@ int main(int argc, char *argv[]) {
   dns_server_t dns_server;
   dns_server_init(&dns_server, loop, listen_addrinfo, dns_server_cb, &app);
 
+  dns_server_tcp_t dns_server_tcp;
+  dns_server_tcp_init(&dns_server_tcp, loop, listen_addrinfo, dns_server_tcp_cb, &app);
+
   freeaddrinfo(listen_addrinfo);
   listen_addrinfo = NULL;
 
@@ -390,6 +438,7 @@ int main(int argc, char *argv[]) {
   ev_signal_stop(loop, &sigint);
   ev_signal_stop(loop, &sigpipe);
   dns_server_stop(&dns_server);
+  dns_server_tcp_stop(&dns_server_tcp);
   stat_stop(&stat);
 
   DLOG("re-entering loop");
@@ -397,6 +446,7 @@ int main(int argc, char *argv[]) {
   DLOG("loop finished all events");
 
   dns_server_cleanup(&dns_server);
+  dns_server_tcp_cleanup(&dns_server_tcp);
   https_client_cleanup(&https_client);
   stat_cleanup(&stat);
 
