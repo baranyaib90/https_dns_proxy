@@ -6,7 +6,8 @@ Before=nss-lookup.target
 After=network.target
 
 [Service]
-Type=simple
+Type=${SERVICE_TYPE}
+TimeoutStartSec=${SERVICE_START_TIMEOUT_SEC}
 DynamicUser=yes
 Restart=on-failure
 ExecStart=${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/https_dns_proxy \
