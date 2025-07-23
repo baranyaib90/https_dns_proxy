@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.7)
 project(HttpsDnsProxy C)
 
+include(CheckIncludeFile)
+
 # FUNCTIONS
 
 # source: https://stackoverflow.com/a/27990434
@@ -81,6 +83,14 @@ endif()
 include_directories(
   ${LIBCARES_INCLUDE_DIR} ${LIBCURL_INCLUDE_DIR}
   ${LIBEV_INCLUDE_DIR} src)
+
+check_include_file("systemd/sd-daemon.h" HAVE_SD_DAEMON_H CMAKE_REQUIRED_QUIET)
+
+if(HAVE_SD_DAEMON_H)
+  message(STATUS "Using libsystemd")
+  add_definitions(-DHAS_LIBSYSTEMD=1)
+  set(LIBS ${LIBS} systemd)
+endif()
 
 # CLANG TIDY
 
