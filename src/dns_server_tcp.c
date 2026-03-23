@@ -1,6 +1,3 @@
-//NOLINTNEXTLINE(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)
-#define _GNU_SOURCE  // needed for having accept4()
-
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -29,7 +26,8 @@
 enum {
   LISTEN_BACKLOG  =   5,
   IDLE_TIMEOUT_S  = 120,  // "two minutes" according to RFC1035 4.2.2
-  RESEND_DELAY_US = 500,  // 0.0005 sec
+  RESPONSE_SEND_ATTEMPTS = 50,   // 0.025 sec max wait
+  RESPONSE_SEND_DELAY_US = 500,  // 0.0005 sec
   TCP_DNS_MAX_PAYLOAD = UINT16_MAX - sizeof(uint16_t),  // Max after 2-byte length prefix
 };
 
@@ -135,7 +133,7 @@ static void read_cb(struct ev_loop __attribute__((unused)) *loop,
     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return;
     } else {
-      WLOG_CLIENT("Read error: %s", strerror(errno));
+      WLOG_CLIENT("Read error: %s (%d), dropping client", strerror(errno), errno);
     }
     remove_client(client);
     return;
@@ -181,7 +179,7 @@ static void read_cb(struct ev_loop __attribute__((unused)) *loop,
   uint8_t request_received = 0;
   while (get_dns_request(client, &dns_req, &req_size)) {
     if (req_size < DNS_HEADER_LENGTH) {
-      WLOG_CLIENT("Malformed request received, too short: %u", req_size);
+      WLOG_CLIENT("Malformed request received, too short: %u, dropping client", req_size);
       free(dns_req);
       remove_client(client);
       return;
@@ -210,16 +208,27 @@ static void accept_cb(struct ev_loop __attribute__((unused)) *loop,
   struct sockaddr_storage client_addr;
   socklen_t client_addr_len = sizeof(client_addr);
 
-  int client_sock = accept(w->fd, (struct sockaddr *)&client_addr, &client_addr_len);
-  if (client_sock != -1) {
-    // Set non-blocking mode for macOS compatibility (Linux accept4 does this atomically)
-    int flags = fcntl(client_sock, F_GETFL, 0);
-    if (flags != -1) {
-      fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
+  // NOLINTNEXTLINE(android-cloexec-accept)
+  const int client_sock = accept(w->fd, (struct sockaddr *)&client_addr, &client_addr_len);
+  if (client_sock == -1) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      ELOG("Failed to accept TCP client: %s (%d)", strerror(errno), errno);
     }
+    return;
   }
-  if (client_sock == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-    ELOG("Failed to accept TCP client: %s", strerror(errno));
+
+  // Set non-blocking mode for macOS compatibility (Linux accept4 does this atomically)
+  const int flags = fcntl(client_sock, F_GETFL, 0);
+  if (flags == -1) {
+    ELOG("Error getting TCP client socket flags: %s (%d), dropping client",
+         strerror(errno), errno);
+    close(client_sock);
+    return;
+  }
+  if (fcntl(client_sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+    ELOG("Error setting TCP client socket to non-blocking: %s (%d), dropping client",
+         strerror(errno), errno);
+    close(client_sock);
     return;
   }
 
@@ -363,7 +372,7 @@ void dns_server_tcp_respond(dns_server_tcp_t *d,
   uint16_t resp_size = htons((uint16_t)resp_len);
   ssize_t len = send(client->sock, &resp_size, sizeof(uint16_t), MSG_MORE | MSG_NOSIGNAL);
   if (len != sizeof(uint16_t)) {
-    WLOG_CLIENT("Send error: %s, len: %d", strerror(errno), len);
+    WLOG_CLIENT("Send error: %s (%d), len: %d, dropping client", strerror(errno), errno, len);
     remove_client(client);
     return;
   }
@@ -371,26 +380,26 @@ void dns_server_tcp_respond(dns_server_tcp_t *d,
   // send the response
   ssize_t sent = 0;
   int attempts = 0;
-  for (; attempts < 50; ++attempts)  // 25ms max wait
+  for (; attempts < RESPONSE_SEND_ATTEMPTS; ++attempts)
   {
     len = send(client->sock, resp + sent, resp_len - (size_t)sent, MSG_NOSIGNAL);
-    if (len < 0) {
+    if (len > 0) {
+      sent += len;
+      if (sent == (ssize_t)resp_len) {
+        break;
+      }
+    } else if (len < 0) {
       if (errno != EAGAIN && errno != EWOULDBLOCK) {
-        WLOG_CLIENT("Send error: %s", strerror(errno));
+        WLOG_CLIENT("Send error: %s (%d), dropping client", strerror(errno), errno);
         remove_client(client);
         return;
       }
-      // EAGAIN/EWOULDBLOCK - socket buffer full, retry after delay
-      continue;
     }
-    sent += len;
-    if (sent == (ssize_t)resp_len) {
-      break;
-    }
-    usleep(RESEND_DELAY_US);
+    usleep(RESPONSE_SEND_DELAY_US);
   }
   if (sent != (ssize_t)resp_len) {
-    WLOG_CLIENT("Send timeout after %d attempts, sent %zd/%zu bytes", attempts, sent, resp_len);
+    WLOG_CLIENT("Send timeout after %d attempts, sent %zd/%zu bytes, dropping client",
+                attempts, sent, resp_len);
     remove_client(client);
     return;
   }
